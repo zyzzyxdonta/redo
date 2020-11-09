@@ -1,0 +1,266 @@
+#!/usr/bin/perl
+
+use 5.020;
+use strict;
+use utf8;
+use warnings;
+
+use Digest::MD5;
+use English;
+use File::Basename qw(fileparse);
+use File::Copy qw(move);
+use File::Path qw(make_path remove_tree);
+use File::Remove qw(remove);
+use File::Spec::Functions qw(catdir);
+use List::Util qw(any);
+use Readonly qw(Readonly);
+
+our $VERSION = 0.1.0;
+
+Readonly my $RETURN_SUCCESS      => 0;
+Readonly my $RETURN_SYSTEM_ERROR => 254;
+Readonly my $RETURN_USER_ERROR   => 255;
+my $EXTENSION_REGEX   = qr/[.][^.]*/msx;
+my $SHELL_PROMPT_NAME = 'PS4';
+my $SHELL_PROMPT      = '+ ';
+my $FAKE_PROMPT       = '- ';
+my $VAR_TARGET        = 'REDO_TARGET';
+my $VAR_VERBOSE       = 'REDO_VERBOSE';
+
+my ($redo, undef, undef) = fileparse $PROGRAM_NAME, $EXTENSION_REGEX;
+my $redo_ifchange = $redo =~ qr/redo-ifchange/msx;
+
+my $usage = <<'END_USAGE';
+Usage:  redo [-v | --verbose] <target>...
+        redo-ifchange <dependency>...
+
+redo-ifchange shall only be called from a .do script.
+END_USAGE
+
+my @options = grep { /^-/msx    } @ARGV;
+my @targets = grep { /^[^-]/msx } @ARGV;
+
+my $help    = any { /^(-h|--help)$/msx    } @options;
+my $verbose = any { /^(-v|--verbose)$/msx } @options;
+
+if ($help) {
+    print $usage;
+    exit $RETURN_SUCCESS;
+}
+
+unless (@targets) {
+    print {*STDERR} $usage;
+    exit $RETURN_USER_ERROR;
+}
+
+my $redo_target = $ENV{$VAR_TARGET};
+if ($redo_ifchange) {
+    unless ($redo_target) {
+        redo_error($RETURN_USER_ERROR, "Environment variable $VAR_TARGET not set");
+    }
+    $verbose = $ENV{$VAR_VERBOSE};
+}
+
+foreach my $target (@targets) {
+    redo_target($target);
+    if ($redo_ifchange) {
+        write_meta_file($redo_target, $target);
+    }
+}
+
+exit;
+
+sub meta_path {
+    my @components = @_;
+    return catdir '.redo', @components;
+}
+
+sub write_meta_file {
+    my ($target, $dependency) = @_;
+
+    my $digest = digest_file($dependency);
+    my $file   = meta_path($target, $digest);
+
+    open my $fh, '>', $file or redo_die("Couldn't open file $_");
+    print {$fh} $dependency;
+    close $fh or redo_die("Couldn't close file $_");
+
+    return;
+}
+
+sub read_meta_file {
+    my ($digest) = @_;
+
+    open my $fh, '<', $digest or redo_die("Couldn't open file $_");
+    my $path = <$fh>;
+    close $fh or redo_die("Couldn't close file $_");
+
+    chomp $path;
+    return $path;
+}
+
+sub digest_file {
+    my ($file) = @_;
+    open my $file_handle, '<', $file or redo_die("Couldn't open file $_");
+
+    my $md5_ctx = Digest::MD5->new;
+    $md5_ctx->addfile($file_handle);
+    my $digest = $md5_ctx->hexdigest;
+
+    close $file_handle or redo_die("Couldn't close file: $_");
+
+    return $digest;
+}
+
+sub read_depedencies {
+    my ($target) = @_;
+    my $dependency_dir = meta_path($target);
+
+    opendir my $dh, $dependency_dir or redo_die("Couldn't open directory $_");
+    my @dependencies = readdir $dh;
+    closedir $dh or redo_die("Couldn't close directory $_");
+
+    @dependencies = grep { $_ ne q{.} and $_ ne q{..} } @dependencies;
+    @dependencies = map { catdir $dependency_dir, $_ } @dependencies;
+    foreach (@dependencies) {
+        open my $fh, '<', $_ or redo_die("Couldn't open file $_");
+        my $dep = <$fh>;
+        close $fh or redo_die("Couldn't close file $_");
+        chomp $dep;
+        $_ = $dep;
+    }
+    return @dependencies;
+}
+
+sub dependency_up_to_date {
+    my ($dependency, $target) = @_;
+
+    my $digest      = digest_file($dependency);
+    my $digest_file = meta_path($target, $digest);
+    if (-e $digest_file) {
+        # dependency is known and hasn't changed
+        return 1;
+    }
+
+    my $dependency_script = redo_script_path($dependency);
+    unless ($dependency_script) {
+        # dependency can't be built, thus it must be a source file
+        return 1;
+    }
+
+    # dependency is up to date if its dependencies are up to date
+    return target_up_to_date($dependency);
+}
+
+sub target_up_to_date {
+    my ($target) = @_;
+    unless (-e $target) {
+        return 0;
+    }
+
+    my $dependency_dir = meta_path($target);
+
+    if (-d $dependency_dir) {
+        my @dependencies = read_depedencies($target);
+        my @deps_up_to_date = map { dependency_up_to_date($_, $target) }
+        @dependencies;
+        return any { $_ } @deps_up_to_date;
+    }
+
+    my $script = redo_script_path($target);
+    if ($script and -e $script) {
+        return dependency_up_to_date($script, $target);
+    }
+
+    return 1;
+}
+
+sub redo_error {
+    my ($ec, @message) = @_;
+    print {*STDERR} "$redo: @message\n";
+    exit $ec;
+}
+
+sub redo_die {
+    my @message = @_;
+    redo_error($RETURN_SYSTEM_ERROR, @message);
+    return; # unreachable
+}
+
+sub redo_script_path {
+    my ($target) = @_;
+
+    my ($name, $path, $extension) = fileparse $target, $EXTENSION_REGEX;
+    my @candidates = ($path . $name . $extension . '.do');
+
+    if ($extension) {
+        push @candidates, $path . 'default' . $extension . '.do';
+    }
+
+    while (@candidates) {
+        my $candidate = shift @candidates;
+        if (-e $candidate) {
+            return $candidate;
+        }
+    }
+
+    return;
+}
+
+sub redo_target {
+    my ($target) = @_;
+
+    if (target_up_to_date($target)) {
+        return;
+    }
+
+    my ($name, $path, $extension) = fileparse $target, $EXTENSION_REGEX;
+    my $target_base = $path . $name;
+    my $redo_script = redo_script_path($target);
+    my $target_tmp  = $target . '---redoing';
+
+    unless ($redo_script) {
+        if (-e $target) {
+            # $target is a source file
+            return;
+        }
+        redo_error($RETURN_USER_ERROR,
+            "No .do script found for target $target");
+    }
+
+    my $dependency_dir = meta_path($target);
+    remove_tree($dependency_dir);
+    make_path($dependency_dir) or redo_error($RETURN_SYSTEM_ERROR,
+        "Error creating directory $dependency_dir");
+
+    write_meta_file($target, $redo_script);
+
+    my @shell_command = qw(sh -e);
+    if ($verbose) {
+        push @shell_command, '-x';
+    }
+    push @shell_command, ($redo_script, '0', $target_base, $target_tmp);
+
+    local $ENV{$VAR_TARGET}        = $target;
+    local $ENV{$VAR_VERBOSE}       = $verbose;
+    local $ENV{$SHELL_PROMPT_NAME} = $SHELL_PROMPT;
+    my $returned = system @shell_command;
+    if ($returned) {
+        redo_error($returned, "Error executing $redo_script");
+    }
+
+    if (-e $target_tmp) {
+        if ($verbose) {
+            print $FAKE_PROMPT . "mv $target_tmp $target\n";
+        }
+        if (not move $target_tmp, $target) {
+            remove $target_tmp;
+            redo_error($RETURN_SYSTEM_ERROR,
+                "Error renaming $target_tmp to $target: $ERRNO");
+        }
+        return;
+    }
+
+    remove $target_tmp;
+    return;
+}
