@@ -10,10 +10,10 @@ This endeavour was in ispired by jekor's video series
 
 ## Installation
 
-Install the executable and a symlink to a directory in your `$PATH`, e.g.:
+Install the executable and the symlink to a directory in your `$PATH`, e.g.:
 
 ```bash
-install redo $HOME/.local/bin
+install -D redo $HOME/.local/bin/redo
 ln -s $HOME/.local/bin/redo $HOME/.local/bin/redo-ifchange
 ```
 
@@ -28,11 +28,11 @@ redo hello_world
 
 ## Known Bugs
 
-Builds in parent directories (e.g. `redo ../some/target`) don't work because this will generate the
-digest files in `$PWD` rather than `$PWD/.redo/`.
-Maybe, this can be fixed by, when executing `redo some/path/target`, switching the working directory 
-to `some/path/`, then building, then switching back to write the digest files to `.redo/`.
-I'm not sure though, where to put the digests; maybe I could just strip any leading `../` parts.
+Out-of-source builds don't work because this will generate the digest files in `$PWD` rather than
+`$PWD/.redo`.
+Maybe, this can be fixed by, when executing `redo some/path/target`, switching the working directory
+to `some/path`, then building, then switching back to write the digest files to `.redo`.
+I'm not sure though, where to put the digests; maybe I could just strip any leading `..` parts.
 This will still not work for cases where a .do script contains `redo-ifchange ../some/target`.
 
 ## Possible enhancements
